@@ -33,5 +33,14 @@ function getUpdates26_Q1_00(): array {
 				"ALTER TABLE library ADD COLUMN workPhoneField CHAR(1) DEFAULT 'p'"
 			]
 		], //sierra_phone_fields
+		// tomas
+		'async_facet_loading' => [
+			'title' => 'Async Facet Loading Configuration',
+			'description' => 'Add enableAsyncFacetLoading setting to library table for configurable async facet loading',
+			'continueOnError' => false,
+			'sql' => [
+				'ALTER TABLE library ADD COLUMN IF NOT EXISTS enableAsyncFacetLoading TINYINT(1) DEFAULT 1 COMMENT "Enable async loading of collapsed facets to improve initial search performance" AFTER groupedWorkDisplaySettingId'
+			]
+		],
 	];
 }
