@@ -827,6 +827,227 @@ class AJAX extends Action {
 		}
 	}
 
+	/**
+	 * Get facet values HTML for async loading of collapsed facets
+	 * This is part of the async facet loading optimization.
+	 *
+	 * @return array
+	 * @noinspection PhpUnused
+	 * @throws ReflectionException
+	 */
+	function getFacetValuesHTML(): array {
+		$searchId = $_REQUEST['searchId'] ?? null;
+		$facetName = $_REQUEST['facetName'] ?? null;
+
+		if (!is_numeric($searchId) || empty($facetName)) {
+			return [
+				'success' => false,
+				'message' => translate([
+					'text' => 'Invalid parameters',
+					'isPublicFacing' => true,
+				])
+			];
+		}
+
+		require_once ROOT_DIR . '/services/API/SearchAPI.php';
+		$searchAPI = new SearchAPI();
+		/** @var SearchObject_GroupedWorkSearcher2 $restoredSearch */
+		$restoredSearch = $searchAPI->restoreSearch($searchId);
+
+		if (empty($restoredSearch)) {
+			return [
+				'success' => false,
+				'message' => translate([
+					'text' => 'Could not restore search',
+					'isPublicFacing' => true,
+				])
+			];
+		}
+
+		$facetConfig = $restoredSearch->getFacetConfig();
+		if (!array_key_exists($facetName, $facetConfig)) {
+			return [
+				'success' => false,
+				'message' => translate([
+					'text' => 'Facet not found',
+					'isPublicFacing' => true,
+				])
+			];
+		}
+
+		$facetSetting = $facetConfig[$facetName];
+		$allFacetConfig = $restoredSearch->getFacetConfig();
+		$originalLimit = $restoredSearch->getLimit();
+
+		$restoredSearch->setLimit(0);
+		// Replace facet config with ONLY the requested facet.
+		$restoredSearch->clearFacets();
+		$restoredSearch->addFacet($facetName, $facetSetting);
+		$restoredSearch->setBypassAsyncFacetLogic(true);
+		$searchResult = $restoredSearch->processSearch(false, true, true);
+
+		// Check if search failed
+		if ($searchResult instanceof AspenError) {
+			global $logger;
+			$logger->log("getFacetValuesHTML failed for facet $facetName: " . $searchResult->toString(), Logger::LOG_ERROR);
+			return [
+				'success' => false,
+				'message' => translate([
+					'text' => 'Search error occurred',
+					'isPublicFacing' => true,
+				])
+			];
+		}
+
+		// Restore original settings.
+		$restoredSearch->setBypassAsyncFacetLogic(false);
+		$restoredSearch->clearFacets();
+		foreach ($allFacetConfig as $key => $setting) {
+			$restoredSearch->addFacet($key, $setting);
+		}
+		$restoredSearch->setLimit($originalLimit);
+
+		// Get facet data for the requested facet.
+		$facetList = $restoredSearch->getFacetList([$facetName => $facetSetting]);
+
+		if (!isset($facetList[$facetName])) {
+			return [
+				'success' => false,
+				'message' => translate([
+					'text' => 'No values available',
+					'isPublicFacing' => true,
+				])
+			];
+		}
+
+		global $interface;
+		$cluster = $facetList[$facetName];
+
+		// Do special processing for certain facet types.
+		if (preg_match('/time_since_added/i', $facetName) || $facetName == 'rating_facet') {
+			require_once ROOT_DIR . '/sys/Recommend/SideFacets.php';
+			$sideFacets = new SideFacets($restoredSearch, '');
+			$updateFunction = $facetName == 'rating_facet' ? 'updateUserRatingsFacet' : 'updateTimeSinceAddedFacet';
+			$cluster = call_user_func([$sideFacets, $updateFunction], $cluster);
+		}
+
+		// Apply facet settings to cluster.
+		if ($facetSetting->sortMode == 'alphabetically') {
+			asort($cluster['list']);
+		}
+		if ($facetSetting->numEntriesToShowByDefault > 0) {
+			$cluster['valuesToShow'] = $facetSetting->numEntriesToShowByDefault;
+		}
+		if ($facetSetting->showAsDropDown) {
+			$cluster['showAsDropDown'] = $facetSetting->showAsDropDown;
+		}
+		if ($facetSetting->multiSelect) {
+			$cluster['multiSelect'] = $facetSetting->multiSelect;
+		}
+
+		global $logger;
+		$logger->log("Facet $facetName: useMoreFacetPopup={$facetSetting->useMoreFacetPopup}, count=" . count($cluster['list']) . ", numEntriesToShowByDefault={$facetSetting->numEntriesToShowByDefault}, numTotalEntriesToShowInMore={$facetSetting->numTotalEntriesToShowInMore}", Logger::LOG_DEBUG);
+
+		if ($facetSetting->useMoreFacetPopup && count($cluster['list']) > $facetSetting->numEntriesToShowByDefault) {
+			$cluster['showMoreFacetPopup'] = true;
+			$facetsList = $cluster['list'];
+			if ($facetSetting->multiSelect) {
+				$tmpList = $cluster['list'];
+				$cluster['list'] = [];
+				// Make sure all applied facets are shown first
+				foreach ($tmpList as $key => $value) {
+					if ($value['isApplied']) {
+						$cluster['list'][$key] = $value;
+						unset($cluster[$key]);
+					}
+				}
+				$tmpList = array_slice($facetsList, 0, $facetSetting->numEntriesToShowByDefault);
+				$cluster['list'] = array_merge($cluster['list'], $tmpList);
+				$cluster['fullUnsortedList'] = array_merge($cluster['list'], $facetsList);
+			} else {
+				$cluster['list'] = array_slice($facetsList, 0, $facetSetting->numEntriesToShowByDefault);
+				$cluster['fullUnsortedList'] = $facetsList;
+			}
+
+			$sortedList = [];
+			foreach ($facetsList as $key => $value) {
+				$sortedList[strtolower($key) . $key] = $value;
+			}
+			ksort($sortedList);
+			$cluster['sortedList'] = $sortedList;
+		} else {
+			$cluster['showMoreFacetPopup'] = false;
+		}
+		$cluster['collapseByDefault'] = $facetSetting->collapseByDefault;
+		$cluster['displayNamePlural'] = empty($facetSetting->displayNamePlural) ? $facetSetting->displayName : $facetSetting->displayNamePlural;
+
+		// Check if facet is locked.
+		$lockSection = $restoredSearch->getSearchName();
+		if (UserAccount::isLoggedIn()) {
+			$user = UserAccount::getActiveUserObj();
+			$lockedFacets = !empty($user->lockedFacets) ? json_decode($user->lockedFacets, true) : [];
+		} else {
+			$lockedFacets = $_SESSION['lockedFilters'] ?? [];
+		}
+		$lockedFacets = $lockedFacets[$lockSection] ?? [];
+		$cluster['locked'] = array_key_exists($facetName, $lockedFacets);
+		$cluster['canLock'] = $facetSetting->canLock;
+
+		$interface->assign('cluster', $cluster);
+		$interface->assign('title', $facetName);
+		$interface->assign('searchId', $searchId);
+
+		$searchLibrary = Library::getActiveLibrary();
+		$location = Location::getSearchLocation();
+		if ($location != null) {
+			$groupedWorkDisplaySettings = $location->getGroupedWorkDisplaySettings();
+		} else {
+			$groupedWorkDisplaySettings = $searchLibrary->getGroupedWorkDisplaySettings();
+		}
+		$hasSearchableFacets = !empty($groupedWorkDisplaySettings->hasSearchableFacets);
+		$interface->assign('hasSearchableFacets', $hasSearchableFacets);
+
+		// Determine which template to use based on facet configuration.
+		$template = 'Search/Recommend/standardFacet.tpl';
+		$isFormBasedFacet = false;
+
+		$yearFacetList = ['publishDate', 'birthYear', 'deathYear', 'publishDateSort'];
+		$sliderFacetList = ['lexile_score', 'accelerated_reader_reading_level', 'accelerated_reader_point_value'];
+
+		// Check for special facet types by name first
+		if (in_array($facetName, $yearFacetList)) {
+			$template = 'Search/Recommend/yearFacetFilter.tpl';
+			$isFormBasedFacet = true;
+		} elseif ($facetName == 'rating_facet') {
+			$template = 'Search/Recommend/ratingFacet.tpl';
+		} elseif (in_array($facetName, $sliderFacetList)) {
+			$template = 'Search/Recommend/sliderFacet.tpl';
+			$isFormBasedFacet = true;
+		} elseif ($facetName == 'start_date') {
+			$template = 'Search/Recommend/calendarFacet.tpl';
+			$isFormBasedFacet = true;
+		} elseif (!empty($facetSetting->showAsDropDown)) {
+			$template = 'Search/Recommend/dropDownFacet.tpl';
+		} elseif (!empty($facetSetting->multiSelect)) {
+			$template = 'Search/Recommend/multiSelectFacet.tpl';
+			$isFormBasedFacet = true;
+		}
+
+		// For form-based facets, pass search parameters to preserve search state.
+		// Needed because GET form submissions discard the action URL's query string.
+		if ($isFormBasedFacet) {
+			$interface->assign('fullPath', $restoredSearch->renderSearchUrl());
+			$interface->assign('searchTerms', $restoredSearch->getSearchTerms() ?? []);
+			$interface->assign('restoredFilters', $restoredSearch->getFilterList() ?? []);
+			$interface->assign('searchSource', $restoredSearch->getSearchSource());
+		}
+
+		return [
+			'success' => true,
+			'html' => $interface->fetch($template)
+		];
+	}
+
 	function getBreadcrumbs(): array {
 		return [];
 	}

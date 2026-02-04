@@ -16,6 +16,13 @@ class SearchObject_GroupedWorkSearcher2 extends SearchObject_AbstractGroupedWork
 	private ?string $fieldsToReturn = null;
 
 	/**
+	 * Flag to bypass async facet loading logic.
+	 * When true, all facets in facetConfig will be loaded regardless of collapseByDefault settings.
+	 * Used for async facet loading requests where we explicitly want to load a specific facet.
+	 */
+	private bool $bypassAsyncFacetLogic = false;
+
+	/**
 	 * Constructor. Initialise some details about the server
 	 *
 	 * @access  public
@@ -164,18 +171,29 @@ class SearchObject_GroupedWorkSearcher2 extends SearchObject_AbstractGroupedWork
 		$facetConfig = $this->getFacetConfig();
 		$availabilityToggleId = null;
 		foreach ($this->filterList as $field => $filter) {
+			// Extract actual field name from first filter if available
+			// filterList may be keyed by display name (e.g., "Literary Form") instead of field name (e.g., "literary_form")
+			$actualFieldName = $field;
+			if (is_array($filter) && !empty($filter)) {
+				$firstFilter = reset($filter);
+				if (is_array($firstFilter) && isset($firstFilter['field'])) {
+					$actualFieldName = $firstFilter['field'];
+				}
+			}
+			
 			$multiSelect = false;
 			$fieldPrefix = '';
-			if (isset($facetConfig[$field])) {
+			if (isset($facetConfig[$actualFieldName])) {
 				/** @var FacetSetting $facetInfo */
-				$facetInfo = $facetConfig[$field];
+				$facetInfo = $facetConfig[$actualFieldName];
 				$facetName = $facetInfo->getFacetName(2);
 				$facetKey = empty($facetInfo->id) ? $facetName : $facetInfo->id;
 				$multiSelect = $facetInfo->multiSelect || $facetName == 'availability_toggle';
 				$fieldPrefix = "{!tag=$facetKey}";
+				$field = $actualFieldName; // Use actual field name for query
 			} else {
 				//This is either a field we need to convert from the old schema to new schema or valid field from advanced search we aren't seeing here
-				$tmpFieldName = substr($field, 0, strrpos($field, '_'));
+				$tmpFieldName = substr($actualFieldName, 0, strrpos($actualFieldName, '_'));
 				if (isset($facetConfig[$tmpFieldName])) {
 					$facetInfo = $facetConfig[$tmpFieldName];
 					$facetName = $facetInfo->getFacetName(2);
@@ -184,8 +202,23 @@ class SearchObject_GroupedWorkSearcher2 extends SearchObject_AbstractGroupedWork
 					$multiSelect = $facetInfo->multiSelect || $facetName == 'availability_toggle';
 					$fieldPrefix = "{!tag=$facetKey}";
 				} else {
-					if (in_array($field, $validFields)) {
-						$facetName = $field;
+					if (in_array($actualFieldName, $validFields)) {
+						$facetName = $actualFieldName;
+						$field = $actualFieldName;
+						// If multiple values, use multiSelect (OR logic)
+						if (count($filter) > 1) {
+							$multiSelect = true;
+							$facetKey = $actualFieldName;
+							$fieldPrefix = "{!tag=$facetKey}";
+						}
+					} elseif (count($filter) > 1) {
+						// If we have multiple values for the same field but no facet config,
+						// default to multiSelect (OR logic) to avoid impossible AND conditions
+						$facetName = $actualFieldName;
+						$field = $actualFieldName;
+						$multiSelect = true;
+						$facetKey = $actualFieldName;
+						$fieldPrefix = "{!tag=$facetKey}";
 					} else {
 						//Unknown field
 						continue;
@@ -313,11 +346,43 @@ class SearchObject_GroupedWorkSearcher2 extends SearchObject_AbstractGroupedWork
 			$facetSet['limit'] = $this->facetLimit;
 			foreach ($facetConfig as $facetField => $facetInfo) {
 				if ($facetInfo instanceof FacetSetting) {
+					$shouldLoad = true;
+					$facetName = $facetInfo->getFacetName(2);
+
+					if (!$this->bypassAsyncFacetLogic) {
+						// Check if async facet loading is enabled for this library
+						$library = Library::getActiveLibrary();
+						$asyncFacetLoadingEnabled = !empty($library->enableAsyncFacetLoading);
+						
+						if ($asyncFacetLoadingEnabled) {
+							// Skip loading only if collapsed AND has no active filters AND is not a top facet.
+							if ($facetInfo->collapseByDefault && !$facetInfo->showAboveResults) {
+							$hasAppliedFilter = false;
+
+							// Check all variations of field name for active filters.
+							foreach ($this->filterList as $field => $filter) {
+								if ($field == $facetField ||
+									$field == $facetName ||
+									str_starts_with($field, $facetName . '_')) {
+									$hasAppliedFilter = true;
+									break;
+								}
+							}
+
+							if (!$hasAppliedFilter) {
+								$shouldLoad = false;
+							}
+						}
+						}
+
+						if (!$shouldLoad) {
+							continue;
+						}
+					}
+
 					$isMultiSelect = $facetInfo->multiSelect;
 					$additionalTags = '';
-					$facetName = $facetInfo->getFacetName(2);
 					if ($facetName == 'availability_toggle' || $facetName == "availability_toggle_$solrScope") {
-						//$isEditionField = true;
 						$isMultiSelect = true;
 						$additionalTags = 'edition_info,edition_info_available_at,edition_info_format_category,edition_info_format';
 					} elseif ($facetName == 'available_at' || $facetName == "available_at_$solrScope") {
@@ -1051,5 +1116,16 @@ class SearchObject_GroupedWorkSearcher2 extends SearchObject_AbstractGroupedWork
 				$this->facetOptions["f.$facetName.facet.limit"] = $facet->numTotalEntriesToShowInMore;
 			}
 		}
+	}
+
+	/**
+	 * Set whether to bypass async facet loading logic.
+	 * When set to true, all facets in facetConfig will be loaded regardless of collapseByDefault settings.
+	 * This is used for async facet loading requests where we explicitly want to load a specific facet.
+	 *
+	 * @param bool $bypass Whether to bypass async facet loading logic
+	 */
+	public function setBypassAsyncFacetLogic(bool $bypass): void {
+		$this->bypassAsyncFacetLogic = $bypass;
 	}
 }
